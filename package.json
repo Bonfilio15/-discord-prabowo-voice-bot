@@ -1,6 +1,6 @@
 {
   "name": "discord-prabowo-voice-bot",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Bot Discord pendeteksi suara kata 'Prabowo' di Voice Channel yang langsung membalas dengan suara 'Hey antek-antek asing!'",
   "main": "index.js",
   "scripts": {
@@ -8,8 +8,10 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@discordjs/voice": "^0.17.0",
-    "discord.js": "^14.16.3",
+    "@discordjs/voice": "^0.19.0",
+    "@snazzah/davey": "^0.1.6",
+    "@stablelib/xchacha20poly1305": "^1.0.1",
+    "discord.js": "^14.18.0",
     "dotenv": "^16.4.5",
     "ffmpeg-static": "^5.2.0",
     "google-tts-api": "^2.0.2",
@@ -18,6 +20,6 @@
     "prism-media": "^1.3.5"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

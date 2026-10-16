@@ -18,7 +18,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-// Server HTTP Keep-Alive (Wajib untuk Render.com Free Web Service + UptimeRobot/Cron-job agar aktif 24/7)
+// Server HTTP Keep-Alive
 const PORT = process.env.PORT || 3000;
 const srv = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -76,16 +76,14 @@ async function autoJoinPopulatedChannels() {
     const existingConn = getVoiceConnection(guild.id);
     if (existingConn) continue;
 
-    const targetChannel = guild.channels.cache.find(
-      (ch) =>
-        ch.isVoiceBased() &&
-        ch.joinable &&
-        ch.members.some((member) => !member.user.bot)
+    // Cari voice state dari user (bukan bot ini) yang sedang berada di Voice Channel
+    const activeVoiceState = guild.voiceStates.cache.find(
+      (vs) => vs.channelId && vs.id !== client.user.id && !vs.member?.user?.bot
     );
 
-    if (targetChannel) {
+    if (activeVoiceState && activeVoiceState.channel && activeVoiceState.channel.joinable) {
       try {
-        await connectAndListen(targetChannel, client);
+        await connectAndListen(activeVoiceState.channel, client);
       } catch {}
     }
   }
@@ -101,7 +99,6 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`⚡ Auto-Join Voice Channel : ${config.autoJoinVoice ? 'AKTIF' : 'NONAKTIF'}`);
   console.log('====================================================');
 
-  // Siapkan file audio (atau buat fallback TTS jika file antek_asing.mp3 belum ada)
   try {
     const audioPath = await resolveAudioFile();
     console.log(`🔊 [Audio] Menggunakan file suara: ${audioPath}`);
@@ -117,15 +114,17 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   if (!config.autoJoinVoice) return;
 
-  // Abaikan event dari bot sendiri
-  if (newState.member?.user?.bot) return;
+  // Abaikan event dari bot sendiri atau bot lain
+  const userId = newState.id || oldState.id;
+  if (userId === client.user?.id) return;
+  if (newState.member?.user?.bot || oldState.member?.user?.bot) return;
 
-  const guild = newState.guild;
+  const guild = newState.guild || oldState.guild;
   const currentConnection = getVoiceConnection(guild.id);
 
-  // 1. Jika ada user baru masuk ke Voice Channel & bot belum join di server tersebut
-  if (newState.channel && !currentConnection) {
-    if (newState.channel.joinable) {
+  // 1. Jika ada user masuk ke Voice Channel & bot belum join di server tersebut
+  if (newState.channelId && !currentConnection) {
+    if (newState.channel && newState.channel.joinable) {
       try {
         await connectAndListen(newState.channel, client);
       } catch {}
@@ -133,14 +132,22 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     return;
   }
 
-  // 2. Jika semua manusia sudah keluar dari Voice Channel tempat bot berada, bot ikut keluar
-  if (oldState.channel && currentConnection) {
+  // 2. Hanya cek keluar jika user BENAR-BENAR pindah/keluar channel (oldState.channelId !== newState.channelId)
+  if (
+    oldState.channelId &&
+    oldState.channelId !== newState.channelId &&
+    currentConnection
+  ) {
     const botChannelId = currentConnection.joinConfig.channelId;
     if (oldState.channelId === botChannelId) {
-      const humanMembers = oldState.channel.members.filter((m) => !m.user.bot);
-      if (humanMembers.size === 0) {
+      // Gunakan voiceStates.cache agar akurat meskipun member belum ter-cache
+      const remainingHumans = guild.voiceStates.cache.filter(
+        (vs) => vs.channelId === botChannelId && vs.id !== client.user?.id && !vs.member?.user?.bot
+      );
+
+      if (remainingHumans.size === 0) {
         console.log(
-          `👋 [Voice] Semua user telah keluar dari "${oldState.channel.name}", bot ikut keluar.`
+          `👋 [Voice] Semua user telah keluar dari "${oldState.channel?.name || 'Voice Channel'}", bot ikut keluar.`
         );
         disconnectVoice(guild.id);
       }
@@ -155,8 +162,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const { commandName, guild, member } = interaction;
   if (!guild) return;
 
+  // Cari channel voice user dari voiceStates.cache atau member.voice
+  const userVoiceState = guild.voiceStates.cache.get(interaction.user.id);
+  const voiceChannel = userVoiceState?.channel || member?.voice?.channel;
+
   if (commandName === 'join') {
-    const voiceChannel = member?.voice?.channel;
     if (!voiceChannel) {
       return interaction.reply({
         content: '❌ Kamu harus masuk ke Voice Channel terlebih dahulu!',
@@ -182,7 +192,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       flags: MessageFlags.Ephemeral,
     });
   } else if (commandName === 'tes-suara') {
-    const voiceChannel = member?.voice?.channel;
     if (!voiceChannel) {
       return interaction.reply({
         content: '❌ Kamu harus berada di Voice Channel untuk mengetes suara!',
@@ -201,7 +210,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// Validasi awal sebelum login
 if (!config.discordToken || config.discordToken.includes('masukkan_token')) {
   console.error('❌ ERROR: DISCORD_TOKEN belum diatur!');
   console.error('👉 Silakan salin file .env.example menjadi .env lalu isi DISCORD_TOKEN Anda.');

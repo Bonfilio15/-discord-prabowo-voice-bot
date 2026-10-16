@@ -13,9 +13,10 @@ const { playPrabowoVoice } = require('./audioPlayer');
 const activeStreams = new Set();
 // Mencegah duplikasi listener speaking pada koneksi guild yang sama
 const initializedConnections = new WeakSet();
+// Mencegah tabrakan koneksi paralel di guild yang sama
+const connectingPromises = new Map();
 
 // Batas maksimal durasi 1 potongan rekaman (4.5 detik pada 48kHz 16-bit mono = 432.000 bytes)
-// Agar jika user bicara panjang tanpa henti, kata "Prabowo" tetap langsung terdeteksi!
 const MAX_CHUNK_BYTES = 48000 * 2 * 4.5;
 
 /**
@@ -40,10 +41,6 @@ async function processUserAudioChunk(pcmBuffer, connection, guild, userId) {
 
 /**
  * Memasang pendengar suara (Voice Receiver) pada koneksi Voice Channel
- *
- * @param {import('@discordjs/voice').VoiceConnection} connection
- * @param {import('discord.js').Guild} guild
- * @param {import('discord.js').Client} client
  */
 function attachReceiverListener(connection, guild, client) {
   if (initializedConnections.has(connection)) return;
@@ -52,7 +49,6 @@ function attachReceiverListener(connection, guild, client) {
   const receiver = connection.receiver;
 
   receiver.speaking.on('start', (userId) => {
-    // Abaikan suara dari bot sendiri atau bot lain
     if (userId === client.user.id) return;
     const member = guild.members.cache.get(userId);
     if (member?.user?.bot) return;
@@ -64,7 +60,7 @@ function attachReceiverListener(connection, guild, client) {
     const opusStream = receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterSilence,
-        duration: 750, // Berhenti merekam setelah 750ms hening
+        duration: 750,
       },
     });
 
@@ -93,7 +89,6 @@ function attachReceiverListener(connection, guild, client) {
       chunks.push(chunk);
       currentBytes += chunk.length;
 
-      // Jika user berbicara panjang tanpa jeda > 4.5 detik, langsung proses potongan ini
       if (currentBytes >= MAX_CHUNK_BYTES) {
         flushAudio();
       }
@@ -120,55 +115,77 @@ function attachReceiverListener(connection, guild, client) {
 
 /**
  * Bergabung ke Voice Channel dan mulai mendengarkan semua pembicaraan user
- *
- * @param {import('discord.js').VoiceBasedChannel} channel
- * @param {import('discord.js').Client} client
- * @returns {Promise<import('@discordjs/voice').VoiceConnection>}
  */
 async function connectAndListen(channel, client) {
-  const connection = joinVoiceChannel({
-    channelId: channel.id,
-    guildId: channel.guild.id,
-    adapterCreator: channel.guild.voiceAdapterCreator,
-    selfDeaf: false, // WAJIB false agar bot bisa mendengar suara mic user
-    selfMute: false,
-  });
+  const guildId = channel.guild.id;
 
-  try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-    console.log(
-      `🔊 [Voice] Terhubung & mendengarkan di channel "${channel.name}" (Server: ${channel.guild.name})`
-    );
-    attachReceiverListener(connection, channel.guild, client);
-  } catch (err) {
-    console.error(`❌ [Voice] Gagal terhubung ke channel "${channel.name}":`, err.message);
-    connection.destroy();
-    throw err;
+  // Jika sudah terhubung & Ready di channel yang sama, langsung pakai koneksi tersebut
+  const existing = getVoiceConnection(guildId);
+  if (
+    existing &&
+    existing.state.status === VoiceConnectionStatus.Ready &&
+    existing.joinConfig.channelId === channel.id
+  ) {
+    attachReceiverListener(existing, channel.guild, client);
+    return existing;
   }
 
-  // Handle reconnect otomatis jika koneksi terputus sementara
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
-    } catch {
-      connection.destroy();
-    }
-  });
+  // Jika sedang dalam proses menghubungkan di server ini, tunggu proses yang sedang berjalan
+  if (connectingPromises.has(guildId)) {
+    return connectingPromises.get(guildId);
+  }
 
-  return connection;
+  const connectTask = (async () => {
+    const connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: guildId,
+      adapterCreator: channel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+      debug: true,
+    });
+
+    connection.on('debug', (msg) => {
+      console.log(`🔍 [Voice Debug] ${msg}`);
+    });
+
+    connection.on('error', (err) => {
+      console.error(`❌ [Voice Error]`, err.message);
+    });
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+      console.log(
+        `🔊 [Voice] Terhubung & mendengarkan di channel "${channel.name}" (Server: ${channel.guild.name})`
+      );
+      attachReceiverListener(connection, channel.guild, client);
+      return connection;
+    } catch (err) {
+      console.error(
+        `❌ [Voice] Gagal terhubung ke channel "${channel.name}" (state terakhir: ${connection.state.status}):`,
+        err.message
+      );
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        connection.destroy();
+      }
+      throw err;
+    }
+  })();
+
+  connectingPromises.set(guildId, connectTask);
+  try {
+    return await connectTask;
+  } finally {
+    connectingPromises.delete(guildId);
+  }
 }
 
 /**
  * Keluar dari Voice Channel di server tertentu
- *
- * @param {string} guildId
  */
 function disconnectVoice(guildId) {
   const connection = getVoiceConnection(guildId);
-  if (connection) {
+  if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
     connection.destroy();
     return true;
   }
